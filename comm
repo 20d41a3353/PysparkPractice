@@ -1,0 +1,170 @@
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, lit, current_timestamp, coalesce, when, substring, length
+from datetime import date, timedelta
+from pyspark.sql.types import DecimalType, StructType, StructField, StringType, TimestampType
+
+def reconcile_balances():
+    today = date.today()
+    yesterday = today - timedelta(days=7)
+    
+    spark = SparkSession.builder \
+    .appName("Balance Sheet Comparison") \
+    .config("spark.driver.extraClassPath", "/app/ojdbc8.jar") \
+    .getOrCreate()
+
+    JDBC_URL = "jdbc:oracle:thin:@//10.177.103.192:1523/fincorepdb1" 
+    DB_USER = "fincore"
+    DB_PASSWORD = "Password#1234"
+    JDBC_DRIVER = "oracle.jdbc.driver.OracleDriver"
+
+    connection_properties = {
+        "user": DB_USER,
+        "password": DB_PASSWORD,
+        "driver": JDBC_DRIVER
+    }
+
+    # Define the single SQL query that joins the tables and filters mismatches
+    sql_query = f"""
+    (SELECT 
+        a.BRANCH_CODE, 
+        a.CURRENCY, 
+        a.CGL, 
+        a.BALANCE AS CBS_BALANCE, 
+        b.BALANCE AS GL_BALANCE,
+        CAST(
+            COALESCE(a.BALANCE, 0) - COALESCE(b.BALANCE, 0) 
+            AS NUMERIC(20, 4)
+        ) AS DIFFERENCE_AMOUNT
+    FROM 
+        CBS_BALANCE a
+    INNER JOIN 
+        GL_BALANCE b
+    ON 
+        a.BRANCH_CODE = b.BRANCH_CODE AND
+        a.CURRENCY = b.CURRENCY AND
+        a.CGL = b.CGL
+    WHERE 
+        (a.BALANCE != b.BALANCE OR a.BALANCE IS NULL OR b.BALANCE IS NULL)
+        AND TRUNC(a.BALANCE_DATE) = TO_DATE('{yesterday}', 'YYYY-MM-DD')
+        AND TRUNC(b.BALANCE_DATE) =  TO_DATE('{yesterday}', 'YYYY-MM-DD')
+    FETCH NEXT 5000 ROWS ONLY) T1"""
+
+
+    # Read the result of the SQL query directly into a single DataFrame
+    mismatches_df_single = spark.read.format("jdbc") \
+    .option("url", JDBC_URL) \
+    .option("dbtable", sql_query) \
+    .options(**connection_properties) \
+    .load()
+
+    output_df_base = mismatches_df_single.select(
+        current_timestamp().alias("RECON_RUN_DATE"),
+        coalesce(col("a.BRANCH_CODE"), col("b.BRANCH_CODE")).alias("BRANCH_CODE"),
+        coalesce(col("a.CURRENCY"), col("b.CURRENCY")).alias("CURRENCY"),
+        coalesce(col("a.CGL"), col("b.CGL")).alias("CGL"),
+        col("a.BALANCE").alias("CBS_BALANCE").cast(DecimalType(20, 4)),
+        col("b.BALANCE").alias("GL_BALANCE").cast(DecimalType(20, 4)),
+        (coalesce(col("a.BALANCE"), lit(0)) - coalesce(col("b.BALANCE"), lit(0))).alias("DIFFERENCE_AMOUNT").cast(DecimalType(20, 4)),
+    )
+    
+    head_rules = [
+        (col("BRANCH_CODE") == "01999", lit("CAO")),
+        (substring(col("CGL"), 9, 1) == "9", lit("PROVISION")),
+        (substring(col("CGL"), 1, 4) == "1204", lit("CASH")),
+        (substring(col("CGL"), 1, 2) == "62", lit("AUCA")),
+        (substring(col("CGL"), 1, 4) == "6363", lit("CTA 6363")),
+        (substring(col("CGL"), 1, 1) == "4", when(substring(col("CGL"), 1, 4) == "4363", lit("CTA 4363")).otherwise(lit("CTA"))),
+        (substring(col("CGL"), 1, 1) == "6", lit("CTA")),
+        (substring(col("CGL"), 1, 1) == "7", lit("I/E")),
+        (substring(col("CGL"), 1, 1) == "8", lit("I/E")),
+        (substring(col("CGL"), 1, 1) == "5", when(col("CURRENCY") == "INR", lit("MEMO")).otherwise(lit("FC MEMO"))),
+        (substring(col("CGL"), 1, 4) == "2148", when(col("CURRENCY") == "INR", lit("BGL")).otherwise(lit("FC"))),
+        (substring(col("CGL"), 1, 4) == "2249", lit("INCA")),
+        (col("CGL").isin("2111", "2115", "2060"), lit("PPF")), # Combined PPF checks
+        (col("CGL") == "1106505002", when(col("BRANCH_CODE").isin("03973", "03974", "03975", "03976", "04030", "04425", "04454", "06939"), lit("LHO")).otherwise(lit("BCGA"))),
+        (col("CGL") == "1000505003", lit("MIGRATION")),
+        (col("CGL") == "1100505001", lit("LHO")),
+        (substring(col("CGL"), 1, 1) == "1", when(col("CURRENCY") == "INR", lit("LOAN")).otherwise(lit("FC")))
+    ]
+    
+    head_column = None
+    for condition, result in head_rules:
+        if head_column is None:
+            head_column = when(condition, result)
+        else:
+            head_column = head_column.when(condition, result)
+            
+    
+    head_column = head_column.otherwise(when(col("CURRENCY") == "INR", lit("DEPOSITS")).otherwise(lit("FC")))
+
+    
+    output_df = output_df_base.withColumn("HEAD", head_column)
+    
+    yesterday_filter_date_str = today.strftime('%Y-%m-%d')
+        
+    difference_df = spark.read.format("jdbc") \
+        .option("url", JDBC_URL) \
+        .option("dbtable", "DIFFERENCE") \
+        .options(**connection_properties) \
+        .load()
+
+    
+    yesterdays_df = difference_df.filter(
+        col("RECON_RUN_DATE").cast("date") == lit(yesterday_filter_date_str).cast("date")
+    ).select(
+        col("BRANCH_CODE").alias("y_BRANCH_CODE"), 
+        col("CURRENCY").alias("y_CURRENCY"), 
+        col("CGL").alias("y_CGL"), 
+        col("DIFFERENCE_AMOUNT").alias("YESTERDAY_DIFF").cast(DecimalType(20, 4))
+    )
+    
+    join_con = [
+        col("BRANCH_CODE") == col("y_BRANCH_CODE"),
+        col("CURRENCY") == col("y_CURRENCY"),
+        col("CGL") == col("y_CGL")
+    ]
+    
+    
+    final_result_df = output_df.join(yesterdays_df, join_con, "left_outer")
+
+    today_diff_coalesced = coalesce(col("DIFFERENCE_AMOUNT"), lit(0))
+    yesterday_diff_coalesced = coalesce(col("YESTERDAY_DIFF"), lit(0))
+    
+    diff_bw_yesterday = (today_diff_coalesced - yesterday_diff_coalesced).cast(DecimalType(20, 4))
+    
+    
+    final_result_df = final_result_df.withColumn("TODAY_DIFF", col("DIFFERENCE_AMOUNT")) \
+                                     .withColumn("DIFF_BW_YESTERDAY", diff_bw_yesterday) \
+        .withColumn(
+        "Type",
+        when(col("YESTERDAY_DIFF").isNull(), "New Entry")
+        .when(col("DIFF_BW_YESTERDAY") == lit(0), "Zero Difference") # Simplified logic for zero diff
+        .otherwise("Diff change") 
+    ).drop("y_BRANCH_CODE", "y_CURRENCY", "y_CGL") # Drop the duplicated join keys
+
+    
+    final_result_df = final_result_df.select(
+        "RECON_RUN_DATE","BRANCH_CODE","CURRENCY","CGL","CBS_BALANCE","GL_BALANCE",
+        "DIFFERENCE_AMOUNT","DIFF_BW_YESTERDAY","TYPE","HEAD"
+    )
+    
+    final_result_df.show(truncate=False)
+    
+    
+    
+    final_result_df.write \
+            .format("jdbc") \
+            .option("dbtable", "DIFFERENCE") \
+            .option("url", JDBC_URL) \
+            .options(**connection_properties) \
+            .option("batchsize", 110000) \
+            .option("numPartitions", 50) \
+            .mode("append") \
+            .save()
+    
+    
+    spark.stop()
+
+if __name__ == "__main__":
+    reconcile_balances()
+ 
