@@ -1,228 +1,363 @@
-# ---------- Optimized parsing + aggregation snippet ----------
-from pyspark.sql import functions as F
-from pyspark.sql.functions import expr, col, when, substring, concat, lit, translate
-from pyspark.sql.types import DecimalType, StringType
+#!/usr/bin/env python3
+"""
+Optimized GLIF processing job (single-file).
+Adjust NUM_PARTITIONS, WRITE_PARTITIONS, and Spark submit resources to match your cluster.
+"""
 
-# ---- 1) Parse input in a single select (reduce intermediate DF objects) ----
-# Note: substring(value, start, len) in Spark SQL uses 1-based indexing
-df_raw = spark.read.text(paths_to_read)  # keep as you had
+import sys
+from datetime import date, timedelta
+from pyspark.sql import SparkSession, functions as F
+from pyspark.sql.functions import expr, col, when, substring, concat, lit
+from pyspark.sql.types import DecimalType, StringType, StructType, StructField, LongType
 
-# parse relevant fields in one select
-df_parsed = df_raw.select(
-    substring("value", 51, 18).alias("Id"),
-    substring("value", 48, 3).alias("currency_code"),
-    # Amount_raw depends on currency: choose offset via when inside select
-    when(substring("value", 48, 3) != "INR",
-         substring("value", 133, 17)).otherwise(substring("value", 116, 17)).alias("Amount_raw"),
-    # last char (sign)
-    when(substring("value", 48, 3) != "INR",
-         substring("value", 149, 1)).otherwise(substring("value", 132, 1)).alias("sign_char")
-).select(
-    "Id",
-    "currency_code",
-    substring("Amount_raw", 1, 16).alias("Amount_base"),
-    substring("Amount_raw", 17, 1).alias("sign_char")
-)
+# --------------------------
+# Configuration (tune these)
+# --------------------------
+NUM_PARTITIONS = 400          # partitions for heavy groupBy (tune to 2-4x total cores)
+WRITE_PARTITIONS = 50         # partitions used for JDBC write
+JDBC_BATCHSIZE = 10000        # JDBC batch size for writes
+SPARK_SHUFFLE_PARTITIONS = 400
 
-# free df_raw
-df_raw.unpersist() if hasattr(df_raw, "unpersist") else None
+# Oracle / HDFS settings (update as required)
+oracle_url = "jdbc:oracle:thin:@//10.177.103.192:1523/fincorepdb1"
+oracle_user = "fincore"
+oracle_password = "Password#1234"
+oracle_driver = "oracle.jdbc.driver.OracleDriver"
 
-# ---- 2) convert sign_char to digit and sign in a compact way ----
-# mapping p->0 q->1 r->2 s->3 t->4 u->5 v->6 w->7 x->8 y->9
-# translate works char->char: we need a 1-to-1 mapping
-# We'll translate pqrstuvwxy -> 0123456789
-df_amounts = df_parsed.withColumn(
-    "last_digit", translate(col("sign_char"), lit("pqrstuvwxy"), lit("0123456789"))
-).withColumn(
-    "sign",
-    when(col("sign_char").isin(['p','q','r','s','t','u','v','w','x','y']), F.lit(-1)).otherwise(F.lit(1))
-).withColumn(
-    # combine: Amount_base (16 chars) + last_digit -> string that becomes e.g. "000000000123450"
-    "Amount_decimal_str", concat(col("Amount_base"), col("last_digit"))
-).withColumn(
-    "Amount_final",
-    (col("Amount_decimal_str").cast(DecimalType(22, 3)) / F.lit(1000)) * col("sign")
-).select(
-    "Id",
-    "currency_code",
-    "Amount_final"
-)
+hdfs_base_path = "hdfs://10.177.103.199:8022/CBS-FILES/2025-11-28/GLIF/"
 
-# Unpersist df_parsed if needed
-df_parsed.unpersist() if hasattr(df_parsed, "unpersist") else None
+# --------------------------
+# Spark session init & tuning
+# --------------------------
+spark = SparkSession.builder \
+    .appName("HDFS_Text_to_Oracle_Optimized") \
+    .config("spark.jars", "./ojdbc8.jar") \
+    .config("spark.sql.adaptive.enabled", "true") \
+    .config("spark.sql.adaptive.coalescePartitions.enabled", "true") \
+    .config("spark.sql.shuffle.partitions", str(SPARK_SHUFFLE_PARTITIONS)) \
+    .config("spark.sql.files.maxPartitionBytes", "256MB") \
+    .config("spark.sql.execution.arrow.pyspark.enabled", "true") \
+    .getOrCreate()
 
-# ---- 3) Split positive and negative once (avoid extra wide DF) ----
-df_signed = df_amounts.withColumn("DEBIT", when(col("Amount_final") > 0, col("Amount_final")).otherwise(F.lit(0))) \
-                      .withColumn("CREDIT", when(col("Amount_final") < 0, col("Amount_final")).otherwise(F.lit(0))) \
-                      .withColumn("ONE", F.lit(1))
+spark.sparkContext.setLogLevel("WARN")
 
-# ---- 4) Repartition by Id (or a hashed key) BEFORE groupBy to avoid skew ----
-# Choose partitions according to cluster capacity, e.g., 400
-NUM_PARTITIONS = 400
-df_repart = df_signed.repartition(NUM_PARTITIONS, "Id")
+# Dates
+today = date.today()
+yesterday = today - timedelta(days=1)
+posting_date_str = yesterday.strftime("%Y-%m-%d")
 
-# Persist if reused; here we aggregate next so persist helps avoid re-computation
-df_repart = df_repart.persist()
+print(f"Using POSTING DATE: {posting_date_str}")
 
-# ---- 5) Aggregation by Id (map-side combine + shuffle) ----
-df_agg = df_repart.groupBy("Id").agg(
-    F.sum("DEBIT").alias("DEBIT_AMOUNT"),
-    F.sum("CREDIT").alias("CREDIT_AMOUNT"),
-    F.sum("ONE").alias("TRANSACTION_COUNT")
-)
+# --------------------------
+# Helper: fetch next batch id
+# --------------------------
+def fetch_next_batch_id():
+    try:
+        df_batch_id = spark.read.format("jdbc") \
+            .option("url", oracle_url) \
+            .option("query", "SELECT get_next_batch_id AS BATCH_ID_VAL FROM DUAL") \
+            .option("user", oracle_user) \
+            .option("password", oracle_password) \
+            .option("driver", oracle_driver) \
+            .option("fetchsize", 1) \
+            .load()
 
-# release memory for df_repart
-df_repart.unpersist()
+        batch_id_value = df_batch_id.collect()[0]["BATCH_ID_VAL"]
+        return int(batch_id_value)
+    except Exception as e:
+        print(f"[ERROR] Could not fetch batch id: {e}", file=sys.stderr)
+        raise
 
-# ---- 6) map Id -> components and add static columns (BATCH_ID literal is fine) ----
-df_mapped = df_agg.select(
-    lit(str(BATCH_ID_LITERAL)).alias("BATCH_ID").cast(StringType()),
-    F.lit(None).cast(StringType()).alias("JOURNAL_ID"),
-    substring("Id", 1, 5).alias("BRANCH_CODE"),
-    substring("Id", 6, 3).alias("CURRENCY"),
-    substring("Id", 9, 10).alias("CGL"),
-    F.lit("CBS consolidated txns").alias("NARRATION"),
-    "DEBIT_AMOUNT",
-    "CREDIT_AMOUNT",
-    "TRANSACTION_COUNT",
-    F.lit("C").alias("SOURCE_FLAG")
-)
+# --------------------------
+# File paths to read
+# --------------------------
+file_types_with_extra = ["INV", "PRI", "BOR", "PRB", "ONL", "AGRI_PY", "AGRI_CY", "INV_IN","INV_TD","INV_DC","BOR_DC"]
+file_types_without_extra = ["INV_BC", "INV_FD", "INV_RE", "GEN_FIT", "INV_B8", "INV_CT", "INV_ECG", "INV_FCI","BOR_VS","INV_GB"]
+paths_to_read = [f"{hdfs_base_path}*GLIF{ft}_[0-9][0-9][0-9].gz" for ft in file_types_with_extra]
+paths_to_read.extend([f"{hdfs_base_path}*GLIF{ft}.gz" for ft in file_types_without_extra])
 
-# ---- 7) Join with branch/currency/cgl lookups (broadcast, since they are small) ----
-# If branch_list/currency_list/master_cgl_list are small, broadcasting is fine
-branch_bcast = broadcast(branch_list.select(col("CODE").alias("BRANCH_CODE")).withColumn("IS_VALID_BRANCH", lit(1)))
-currency_bcast = broadcast(currency_list.select(col("CURRENCY_CODE").alias("CURRENCY")).withColumn("IS_VALID_CURRENCY", lit(1)))
-cgl_bcast = broadcast(master_cgl_list.select(col("CGL_NUMBER").alias("CGL")).withColumn("IS_VALID", lit(1)))
+# --------------------------------------
+# Read and parse source text in one pass
+# --------------------------------------
+def parse_and_aggregate(batch_id_literal):
+    # Read text (gz compressed; each gz file is unsplittable, so ensure gz sizes are reasonable)
+    df_raw = spark.read.text(paths_to_read)
 
-df_valid_branch = df_mapped.join(branch_bcast, on="BRANCH_CODE", how="left") \
-    .withColumn("VALIDATED_BRANCH", when(col("IS_VALID_BRANCH").isNotNull(), col("BRANCH_CODE")).otherwise(lit("invalid_BRANCH")))
-
-df_valid_currency = df_valid_branch.join(currency_bcast, on="CURRENCY", how="left") \
-    .withColumn("VALIDATED_CURRENCY", when(col("IS_VALID_CURRENCY").isNotNull(), col("CURRENCY")).otherwise(lit("invalid_CURRENCY")))
-
-df_validated = df_valid_currency.join(cgl_bcast, on="CGL", how="left") \
-    .withColumn(
-        "VALIDATED_CGL",
-        when(col("IS_VALID").isNotNull(), col("CGL"))
-        .when(col("CGL").startswith("5"), lit("5000000000"))
-        .otherwise(lit("1111111111"))
-    ).withColumn(
-        "NARRATION1",
-        when(col("IS_VALID").isNull(), concat(lit("INVALID CGL: "), col("CGL"), lit(" - "), col("NARRATION"))).otherwise(col("NARRATION"))
+    # Single select to extract all needed substrings
+    # substring in Spark SQL is 1-based
+    df_parsed = df_raw.select(
+        substring("value", 51, 18).alias("Id"),
+        substring("value", 48, 3).alias("currency_code"),
+        when(substring("value", 48, 3) != "INR",
+             substring("value", 133, 17)).otherwise(substring("value", 116, 17)).alias("Amount_raw"),
+        when(substring("value", 48, 3) != "INR",
+             substring("value", 149, 1)).otherwise(substring("value", 132, 1)).alias("sign_char")
+    ).select(
+        "Id",
+        "currency_code",
+        substring("Amount_raw", 1, 16).alias("Amount_base"),
+        substring("Amount_raw", 17, 1).alias("sign_char")
     )
 
-# Drop intermediate markers and persist small df for later grouping
-df_validated = df_validated.drop("IS_VALID_BRANCH", "IS_VALID_CURRENCY", "IS_VALID")
+    # Free df_raw asap
+    try:
+        df_raw.unpersist()
+    except Exception:
+        pass
 
-# ---- 8) Group by validated CGL/CURRENCY/BRANCH to combine duplicates (reduce further shuffle) ----
-result = df_validated.groupBy("VALIDATED_CGL", "CURRENCY", "BRANCH_CODE").agg(
-    F.sum("DEBIT_AMOUNT").alias("DEBIT_AMOUNT"),
-    F.sum("CREDIT_AMOUNT").alias("CREDIT_AMOUNT"),
-    F.sum("TRANSACTION_COUNT").alias("TRANSACTION_COUNT"),
-    F.first("NARRATION1").alias("NARRATION"),
-    F.first("SOURCE_FLAG").alias("SOURCE_FLAG"),
-    F.first("BATCH_ID").alias("BATCH_ID"),
-    F.first("JOURNAL_ID").alias("JOURNAL_ID")
-).select(
-    F.col("VALIDATED_CGL").alias("CGL"),
-    "CURRENCY", "BRANCH_CODE", "NARRATION", "SOURCE_FLAG", "BATCH_ID",
-    "DEBIT_AMOUNT", "CREDIT_AMOUNT", "TRANSACTION_COUNT", "JOURNAL_ID"
-)
+    # Translate sign characters p->0 q->1 ... y->9 using translate and compute final decimal
+    # Note: translate(Column, matchingStr, replaceStr)
+    df_amounts = df_parsed.withColumn(
+        "last_digit", F.translate(col("sign_char"), "pqrstuvwxy", "0123456789")
+    ).withColumn(
+        "sign", when(col("sign_char").isin(list("pqrstuvwxy")), lit(-1)).otherwise(lit(1))
+    ).withColumn(
+        "Amount_decimal_str", concat(col("Amount_base"), col("last_digit"))
+    ).withColumn(
+        "Amount_final", (col("Amount_decimal_str").cast(DecimalType(22, 3)) / lit(1000)) * col("sign")
+    ).select("Id", "currency_code", "Amount_final")
 
-# ---- 9) Collapse into final buckets and create synthetic rows where NET != 0 ----
-result_net1 = result.withColumn(
-    "check", when(substring(col("CGL"), 1, 1) == "5", lit("5000000000")).otherwise(lit("1111111111"))
-)
+    try:
+        df_parsed.unpersist()
+    except Exception:
+        pass
 
-new_result = result_net1.groupBy("BRANCH_CODE", "CURRENCY", col("check").alias("CGL")).agg(
-    F.sum("DEBIT_AMOUNT").alias("DEBIT_AMOUNT"),
-    F.sum("CREDIT_AMOUNT").alias("CREDIT_AMOUNT"),
-    F.first("NARRATION").alias("NARRATION"),
-    F.first("SOURCE_FLAG").alias("SOURCE_FLAG"),
-    F.first("BATCH_ID").alias("BATCH_ID"),
-    F.first("JOURNAL_ID").alias("JOURNAL_ID"),
-    F.sum("TRANSACTION_COUNT").alias("TRANSACTION_COUNT")
-).withColumn("NET", col("DEBIT_AMOUNT") + col("CREDIT_AMOUNT"))
+    # Split into positives and negatives as columns and keep a counter for transactions
+    df_signed = df_amounts.withColumn("DEBIT", when(col("Amount_final") > 0, col("Amount_final")).otherwise(lit(0))) \
+                          .withColumn("CREDIT", when(col("Amount_final") < 0, col("Amount_final")).otherwise(lit(0))) \
+                          .withColumn("ONE", lit(1))
 
-synthetic = new_result.filter(col("NET") != 0).select(
-    col("CGL"), col("CURRENCY"), col("BRANCH_CODE"),
-    when(col("NET") < 0, -col("NET")).otherwise(lit(0)).alias("DEBIT_AMOUNT"),
-    when(col("NET") > 0, -col("NET")).otherwise(lit(0)).alias("CREDIT_AMOUNT"),
-    col("TRANSACTION_COUNT"),
-    F.lit("OUT OF BALANCE").alias("NARRATION"),
-    col("SOURCE_FLAG"),
-    col("BATCH_ID"),
-    col("JOURNAL_ID")
-)
+    # Repartition by Id to spread load before aggregation
+    df_repart = df_signed.repartition(NUM_PARTITIONS, "Id").persist()
 
-final_balanced = new_result.unionByName(synthetic).withColumn("TRANSACTION_DATE", F.to_date(F.lit(posting_date_str)))
+    # Aggregate by Id
+    df_agg = df_repart.groupBy("Id").agg(
+        F.sum("DEBIT").alias("DEBIT_AMOUNT"),
+        F.sum("CREDIT").alias("CREDIT_AMOUNT"),
+        F.sum("ONE").alias("TRANSACTION_COUNT")
+    )
 
-# ---- 10) Partition control before JDBC writes ----
-# Repartition to a number of partitions appropriate for parallel JDBC writes.
-# Use fewer partitions for many small writes; more partitions to parallelize large writes.
-WRITE_PARTITIONS = 50
-final_for_write = final_balanced.repartition(WRITE_PARTITIONS, "BRANCH_CODE")  # choose a column for locality
+    # Release partitioned DF
+    try:
+        df_repart.unpersist()
+    except Exception:
+        pass
 
-# Write GL_TRANS - control batchsize and partitions
-final_for_write.write \
-    .format("jdbc") \
-    .option("url", oracle_url) \
-    .option("dbtable", "GL_TRANS") \
-    .option("user", oracle_user) \
-    .option("password", oracle_password) \
-    .option("driver", oracle_driver) \
-    .option("batchsize", 10000) \
-    .mode("append") \
-    .save()
+    # Map components from Id and add job-level static columns
+    df_mapped = df_agg.select(
+        lit(str(batch_id_literal)).alias("BATCH_ID").cast(StringType()),
+        lit(None).cast(StringType()).alias("JOURNAL_ID"),
+        substring("Id", 1, 5).alias("BRANCH_CODE"),
+        substring("Id", 6, 3).alias("CURRENCY"),
+        substring("Id", 9, 10).alias("CGL"),
+        lit("CBS consolidated txns").alias("NARRATION"),
+        "DEBIT_AMOUNT",
+        "CREDIT_AMOUNT",
+        "TRANSACTION_COUNT",
+        lit("C").alias("SOURCE_FLAG")
+    )
 
-# ---- 11) GL balance update: compute processed_df small and union with db data ----
-processed_df = final_balanced.withColumn("BALANCE", col("DEBIT_AMOUNT") + col("CREDIT_AMOUNT")) \
-                             .select("CGL", "BALANCE", "CURRENCY", "BRANCH_CODE")
+    return df_mapped
 
-# read GL_BAL for previous date: keep SQL parameter as string with proper format
-filter_date_str = yesterday.strftime("%Y-%m-%d")
-sql_query = f"(SELECT CGL,BALANCE,CURRENCY,BRANCH_CODE FROM GL_BALANCE WHERE TRUNC(BALANCE_DATE) = TO_DATE('{filter_date_str}','YYYY-MM-DD')) T1"
+# ----------------------------
+# Read master lookup tables
+# ----------------------------
+def read_lookup_tables():
+    # Branch list
+    branch_query = "(SELECT code FROM branch_master) T1"
+    branch_list = spark.read.format("jdbc") \
+        .option("url", oracle_url) \
+        .option("dbtable", branch_query) \
+        .option("user", oracle_user) \
+        .option("password", oracle_password) \
+        .option("driver", oracle_driver) \
+        .option("fetchsize", 10000) \
+        .load()
 
-df_date_filtered = spark.read.format("jdbc") \
-    .option("url", oracle_url) \
-    .option("dbtable", sql_query) \
-    .option("user", oracle_user) \
-    .option("password", oracle_password) \
-    .option("driver", oracle_driver) \
-    .option("fetchsize", 10000) \
-    .load()
+    # Currency list
+    currency_query = "(SELECT CURRENCY_CODE FROM currency_master) T1"
+    currency_list = spark.read.format("jdbc") \
+        .option("url", oracle_url) \
+        .option("dbtable", currency_query) \
+        .option("user", oracle_user) \
+        .option("password", oracle_password) \
+        .option("driver", oracle_driver) \
+        .option("fetchsize", 10000) \
+        .load()
 
-# union + final aggregation; repartition before final write
-combined_df = processed_df.unionByName(df_date_filtered)
-final_aggregated_df = combined_df.groupBy("CGL", "CURRENCY", "BRANCH_CODE").agg(F.sum("BALANCE").alias("BALANCE")) \
-                                 .orderBy("CGL", "BRANCH_CODE") \
-                                 .withColumn("BALANCE_DATE", F.to_date(F.lit(posting_date_str)))
+    # CGL master (only those with BAL_COMPARE = 1)
+    cgl_query = "(SELECT CGL_NUMBER FROM cgl_master WHERE BAL_COMPARE = 1) T1"
+    master_cgl_list = spark.read.format("jdbc") \
+        .option("url", oracle_url) \
+        .option("dbtable", cgl_query) \
+        .option("user", oracle_user) \
+        .option("password", oracle_password) \
+        .option("driver", oracle_driver) \
+        .option("fetchsize", 10000) \
+        .load()
 
-final_aggregated_df = final_aggregated_df.repartition(WRITE_PARTITIONS, "BRANCH_CODE")
+    return branch_list, currency_list, master_cgl_list
 
-final_aggregated_df.write \
-    .format("jdbc") \
-    .option("url", oracle_url) \
-    .option("dbtable", "GL_BAL") \
-    .option("user", oracle_user) \
-    .option("password", oracle_password) \
-    .option("driver", oracle_driver) \
-    .option("batchsize", 10000) \
-    .mode("append") \
-    .save()
+# ----------------------------
+# Validate and collapse logic
+# ----------------------------
+def validate_and_collapse(df_mapped, branch_list, currency_list, master_cgl_list):
+    # Broadcast small lookup frames for faster joins
+    branch_bcast = F.broadcast(branch_list.select(col("CODE").alias("BRANCH_CODE")).withColumn("IS_VALID_BRANCH", lit(1)))
+    currency_bcast = F.broadcast(currency_list.select(col("CURRENCY_CODE").alias("CURRENCY")).withColumn("IS_VALID_CURRENCY", lit(1)))
+    cgl_bcast = F.broadcast(master_cgl_list.select(col("CGL_NUMBER").alias("CGL")).withColumn("IS_VALID", lit(1)))
 
-# clean up
-spark.catalog.clearCache()
+    df_valid_branch = df_mapped.join(branch_bcast, on="BRANCH_CODE", how="left") \
+        .withColumn("VALIDATED_BRANCH", when(col("IS_VALID_BRANCH").isNotNull(), col("BRANCH_CODE")).otherwise(lit("invalid_BRANCH")))
 
+    df_valid_currency = df_valid_branch.join(currency_bcast, on="CURRENCY", how="left") \
+        .withColumn("VALIDATED_CURRENCY", when(col("IS_VALID_CURRENCY").isNotNull(), col("CURRENCY")).otherwise(lit("invalid_CURRENCY")))
 
---conf spark.sql.shuffle.partitions=400       # set to about 2-4x total core count
---conf spark.sql.adaptive.enabled=true
---conf spark.sql.adaptive.coalescePartitions.enabled=true
---conf spark.executor.memory=30g
---conf spark.executor.cores=5
---conf spark.executor.instances=10
---conf spark.driver.memory=8g
---conf spark.memory.fraction=0.6
---conf spark.memory.storageFraction=0.3
---conf spark.executor.memoryOverhead=4g
---conf spark.hadoop.mapreduce.input.fileinputformat.split.minsize=134217728  # 128MB
+    df_validated = df_valid_currency.join(cgl_bcast, on="CGL", how="left") \
+        .withColumn(
+            "VALIDATED_CGL",
+            when(col("IS_VALID").isNotNull(), col("CGL"))
+            .when(col("CGL").startswith("5"), lit("5000000000"))
+            .otherwise(lit("1111111111"))
+        ).withColumn(
+            "NARRATION1",
+            when(col("IS_VALID").isNull(), concat(lit("INVALID CGL: "), col("CGL"), lit(" - "), col("NARRATION"))).otherwise(col("NARRATION"))
+        )
+
+    # drop helper flags
+    df_validated = df_validated.drop("IS_VALID_BRANCH", "IS_VALID_CURRENCY", "IS_VALID")
+
+    # Group by validated cgl/currency/branch to combine duplicates (reduce shuffle downstream)
+    result = df_validated.groupBy("VALIDATED_CGL", "CURRENCY", "BRANCH_CODE").agg(
+        F.sum("DEBIT_AMOUNT").alias("DEBIT_AMOUNT"),
+        F.sum("CREDIT_AMOUNT").alias("CREDIT_AMOUNT"),
+        F.sum("TRANSACTION_COUNT").alias("TRANSACTION_COUNT"),
+        F.first("NARRATION1").alias("NARRATION"),
+        F.first("SOURCE_FLAG").alias("SOURCE_FLAG"),
+        F.first("BATCH_ID").alias("BATCH_ID"),
+        F.first("JOURNAL_ID").alias("JOURNAL_ID")
+    ).select(
+        F.col("VALIDATED_CGL").alias("CGL"),
+        "CURRENCY", "BRANCH_CODE", "NARRATION", "SOURCE_FLAG", "BATCH_ID",
+        "DEBIT_AMOUNT", "CREDIT_AMOUNT", "TRANSACTION_COUNT", "JOURNAL_ID"
+    )
+
+    # Collapse into final CGL buckets (5* -> 5000000000 else 1111111111)
+    result_net1 = result.withColumn("check", when(substring(col("CGL"), 1, 1) == "5", lit("5000000000")).otherwise(lit("1111111111")))
+
+    new_result = result_net1.groupBy("BRANCH_CODE", "CURRENCY", col("check").alias("CGL")).agg(
+        F.sum("DEBIT_AMOUNT").alias("DEBIT_AMOUNT"),
+        F.sum("CREDIT_AMOUNT").alias("CREDIT_AMOUNT"),
+        F.first("NARRATION").alias("NARRATION"),
+        F.first("SOURCE_FLAG").alias("SOURCE_FLAG"),
+        F.first("BATCH_ID").alias("BATCH_ID"),
+        F.first("JOURNAL_ID").alias("JOURNAL_ID"),
+        F.sum("TRANSACTION_COUNT").alias("TRANSACTION_COUNT")
+    ).withColumn("NET", col("DEBIT_AMOUNT") + col("CREDIT_AMOUNT"))
+
+    synthetic = new_result.filter(col("NET") != 0).select(
+        col("CGL"), col("CURRENCY"), col("BRANCH_CODE"),
+        when(col("NET") < 0, -col("NET")).otherwise(lit(0)).alias("DEBIT_AMOUNT"),
+        when(col("NET") > 0, -col("NET")).otherwise(lit(0)).alias("CREDIT_AMOUNT"),
+        col("TRANSACTION_COUNT"),
+        lit("OUT OF BALANCE").alias("NARRATION"),
+        col("SOURCE_FLAG"),
+        col("BATCH_ID"),
+        col("JOURNAL_ID")
+    )
+
+    final_balanced = new_result.unionByName(synthetic).withColumn("TRANSACTION_DATE", F.to_date(F.lit(posting_date_str)))
+
+    return final_balanced
+
+# ----------------------------
+# JDBC write helpers
+# ----------------------------
+def write_to_jdbc(df, table_name, partitions=WRITE_PARTITIONS, mode="append"):
+    df_for_write = df.repartition(partitions, "BRANCH_CODE")
+    try:
+        df_for_write.write \
+            .format("jdbc") \
+            .option("url", oracle_url) \
+            .option("dbtable", table_name) \
+            .option("user", oracle_user) \
+            .option("password", oracle_password) \
+            .option("driver", oracle_driver) \
+            .option("batchsize", JDBC_BATCHSIZE) \
+            .mode(mode) \
+            .save()
+        print(f"[INFO] Wrote {table_name} to JDBC (mode={mode})")
+    except Exception as e:
+        print(f"[ERROR] Failed to write {table_name}: {e}", file=sys.stderr)
+        raise
+
+# ----------------------------
+# GL_BAL combine & write
+# ----------------------------
+def update_gl_balance(final_balanced):
+    processed_df = final_balanced.withColumn("BALANCE", col("DEBIT_AMOUNT") + col("CREDIT_AMOUNT")) \
+                                 .select("CGL", "BALANCE", "CURRENCY", "BRANCH_CODE")
+
+    # Read previous day's GL_BAL
+    filter_date_str = posting_date_str  # already YYYY-MM-DD
+    sql_query = f"(SELECT CGL, BALANCE, CURRENCY, BRANCH_CODE FROM GL_BALANCE WHERE TRUNC(BALANCE_DATE) = TO_DATE('{filter_date_str}','YYYY-MM-DD')) T1"
+
+    df_date_filtered = spark.read.format("jdbc") \
+        .option("url", oracle_url) \
+        .option("dbtable", sql_query) \
+        .option("user", oracle_user) \
+        .option("password", oracle_password) \
+        .option("driver", oracle_driver) \
+        .option("fetchsize", 10000) \
+        .load()
+
+    combined_df = processed_df.unionByName(df_date_filtered)
+    final_aggregated_df = combined_df.groupBy("CGL", "CURRENCY", "BRANCH_CODE").agg(F.sum("BALANCE").alias("BALANCE")) \
+        .orderBy("CGL", "BRANCH_CODE").withColumn("BALANCE_DATE", F.to_date(F.lit(posting_date_str)))
+
+    # Write final GL_BAL
+    write_to_jdbc(final_aggregated_df, "GL_BAL")
+
+# ----------------------------
+# Main execution
+# ----------------------------
+def main():
+    batch_id_literal = fetch_next_batch_id()
+    print(f"[INFO] Fetched BATCH_ID: {batch_id_literal}")
+
+    # Step 1: parse and aggregate
+    df_mapped = parse_and_aggregate(batch_id_literal)
+    print("[INFO] Parsed and aggregated by Id -> produced mapped DF")
+
+    # Step 2: read lookup tables
+    branch_list, currency_list, master_cgl_list = read_lookup_tables()
+    print("[INFO] Loaded lookup tables (branch, currency, cgl)")
+
+    # Step 3: validate and collapse
+    final_balanced = validate_and_collapse(df_mapped, branch_list, currency_list, master_cgl_list)
+    print("[INFO] Validation and collapse complete; produced final_balanced")
+
+    # Optional quick show for debugging (remove in prod)
+    # final_balanced.show(5, truncate=False)
+
+    # Step 4: write GL_TRANS
+    write_to_jdbc(final_balanced, "GL_TRANS", partitions=WRITE_PARTITIONS)
+    print("[INFO] Wrote GL_TRANS")
+
+    # Step 5: update GL_BAL table
+    update_gl_balance(final_balanced)
+    print("[INFO] Updated GL_BAL")
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        print(f"[ERROR] Job failed: {e}", file=sys.stderr)
+        raise
+    finally:
+        try:
+            spark.catalog.clearCache()
+        except Exception:
+            pass
+        spark.stop()
+        print("[INFO] Spark stopped")
